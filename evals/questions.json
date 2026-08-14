@@ -1,0 +1,39 @@
+{
+  "test_questions": [
+    {
+      "id": "q1",
+      "query": "What is our AI deployment policy?",
+      "expected_answer": "AI deployments require technical review by AI Safety team, security assessment, legal compliance check, and executive sign-off for production deployments. All models must be tested for bias and safety, include monitoring and rollback procedures, maintain data privacy, and undergo regular audits every 6 months.",
+      "expected_citations": ["policies/ai_deployment_policy"],
+      "category": "policies"
+    },
+    {
+      "id": "q2",
+      "query": "What decisions were made about authentication last month?",
+      "expected_answer": "The meeting approved migration to OAuth 2.0 for all customer-facing applications (Q4 2024), required MFA for all internal tools by August 2024, set session timeout to 30 minutes for sensitive operations, and approved a remember me feature for non-sensitive operations.",
+      "expected_citations": ["meetings/authentication_decision_2024_07"],
+      "category": "meetings"
+    },
+    {
+      "id": "q3",
+      "query": "What's on the product roadmap for Q4 2024?",
+      "expected_answer": "Q4 2024 includes enterprise features, advanced analytics, and custom integrations.",
+      "expected_citations": ["product/product_roadmap"],
+      "category": "product"
+    },
+    {
+      "id": "q4",
+      "query": "What are our security requirements?",
+      "expected_answer": "Security requirements include MFA for all system access, role-based access control with quarterly reviews, encryption at rest and in transit, no plaintext credential storage, regular security audits, and reporting security incidents within 1 hour.",
+      "expected_citations": ["policies/security_policy"],
+      "category": "policies"
+    },
+    {
+      "id": "q5",
+      "query": "What are the 2025 product priorities?",
+      "expected_answer": "2025 priorities include AI-powered recommendations, real-time collaboration, and enhanced security features.",
+      "expected_citations": ["product/product_roadmap"],
+      "category": "product"
+    }
+  ]
+}
