@@ -8,12 +8,15 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import json
+import logging
 from datetime import datetime
 
 from config import (
     POLICIES_DIR, PRODUCT_DIR, ENGINEERING_DIR, 
     MEETINGS_DIR, INTERNAL_DIR
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -27,6 +30,7 @@ class Document:
     metadata: Dict
     created_at: str
     updated_at: str
+    source: str = "local"
 
 
 class DocumentLoader:
@@ -101,7 +105,7 @@ class DocumentLoader:
                 updated_at=datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
             )
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
+            logger.error(f"Error loading {file_path}: {e}")
             return None
     
     def _load_text(self, file_path: Path, category: str) -> Optional[Document]:
@@ -123,7 +127,7 @@ class DocumentLoader:
                 updated_at=datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
             )
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
+            logger.error(f"Error loading {file_path}: {e}")
             return None
     
     def _load_json(self, file_path: Path, category: str) -> Optional[Document]:
@@ -155,7 +159,7 @@ class DocumentLoader:
                 updated_at=datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
             )
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
+            logger.error(f"Error loading {file_path}: {e}")
             return None
     
     def get_document(self, doc_id: str) -> Optional[Document]:

@@ -1,274 +1,142 @@
 """
 Main MCP Server for Company Brain.
 Implements the Model Context Protocol server for document access.
+
+Runs as its own process and speaks MCP (JSON-RPC over stdio) via the official
+`mcp` SDK. stdout is the protocol channel, so all logging goes to stderr/file.
+
+Run from the project root:
+    python server/mcp_server.py
 """
 
-import asyncio
 import json
 import logging
-from typing import Dict, Any, Optional
+import sys
 from pathlib import Path
+from typing import Any, Dict, Optional
+
+from mcp.server import MCPServer
+
+# The connectors package lives at the project root, not inside server/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from connectors import SyncManager, FilesystemConnector  # noqa: E402
 
 from config import (
-    MCP_SERVER_NAME, MCP_SERVER_VERSION, LOG_LEVEL, LOG_FILE
+    MCP_SERVER_NAME, MCP_SERVER_VERSION, SERVER_ROLE, LOG_LEVEL, LOG_FILE,
+    KNOWLEDGE_DIR, CONNECTORS_JSON
 )
 from document_loader import DocumentLoader
-from permissions import PermissionManager, Role
+from permissions import PermissionManager
 from tools import MCPTools, ToolResult
 from embeddings import EmbeddingSearch
 
 
-# Setup logging
+# Setup logging (never to stdout -- that is the MCP wire)
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stderr)
     ]
 )
 logger = logging.getLogger(__name__)
 
 
-class MCPServer:
-    """MCP Server for Company Brain."""
-    
-    def __init__(self):
-        self.loader = DocumentLoader()
-        self.permission_manager = PermissionManager()
-        self.embedding_search = EmbeddingSearch()
-        self.tools = MCPTools(self.loader, self.permission_manager, self.embedding_search)
-        self.current_role = Role.GUEST  # Default role
-        
-        # Load documents
-        logger.info("Loading documents from knowledge base...")
-        documents = self.loader.load_all()
-        logger.info(f"Loaded {len(documents)} documents")
-        
-        # Index documents for semantic search
-        logger.info("Indexing documents for semantic search...")
-        self.embedding_search.index_documents(documents)
-    
-    async def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle an MCP request."""
-        method = request.get("method")
-        params = request.get("params", {})
-        request_id = request.get("id")
-        
-        logger.info(f"Received request: {method}")
-        
+def _build_connector(name: str, ctype: str, cfg: Dict[str, Any]) -> Any:
+    from connectors import GitHubConnector, SlackExportConnector
+    if ctype == "filesystem":
+        return FilesystemConnector(name, cfg)
+    if ctype == "github":
+        return GitHubConnector(name, cfg)
+    if ctype == "slack":
+        return SlackExportConnector(name, cfg)
+    logger.error(f"Unknown connector type: {ctype}")
+    return None
+
+
+def _create_sync_manager() -> SyncManager:
+    sync = SyncManager()
+    # Always sync the local knowledge directory first.
+    sync.add_connector(FilesystemConnector("knowledge", {"root": str(KNOWLEDGE_DIR)}))
+    # Optionally load additional connectors from COMPANY_BRAIN_CONNECTORS env var.
+    if CONNECTORS_JSON:
         try:
-            if method == "initialize":
-                return await self._handle_initialize(params, request_id)
-            elif method == "tools/list":
-                return await self._handle_tools_list(request_id)
-            elif method == "tools/call":
-                return await self._handle_tool_call(params, request_id)
-            elif method == "set_role":
-                return await self._handle_set_role(params, request_id)
-            else:
-                return self._error_response(request_id, -32601, "Method not found")
+            for entry in json.loads(CONNECTORS_JSON):
+                conn = _build_connector(entry["name"], entry["type"], entry.get("config", {}))
+                if conn:
+                    sync.add_connector(conn)
         except Exception as e:
-            logger.error(f"Error handling request: {e}")
-            return self._error_response(request_id, -32603, str(e))
-    
-    async def _handle_initialize(self, params: Dict[str, Any], request_id: Any) -> Dict[str, Any]:
-        """Handle initialize request."""
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {
-                    "name": MCP_SERVER_NAME,
-                    "version": MCP_SERVER_VERSION
-                },
-                "capabilities": {
-                    "tools": {}
-                }
-            }
-        }
-    
-    async def _handle_tools_list(self, request_id: Any) -> Dict[str, Any]:
-        """Handle tools/list request."""
-        tools = [
-            {
-                "name": "list_policies",
-                "description": "List all policy documents",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "read_document",
-                "description": "Read a specific document by ID",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "doc_id": {
-                            "type": "string",
-                            "description": "Document ID to read"
-                        }
-                    },
-                    "required": ["doc_id"]
-                }
-            },
-            {
-                "name": "search_documents",
-                "description": "Search documents by query",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query"
-                        },
-                        "category": {
-                            "type": "string",
-                            "description": "Optional category to search within"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "find_meeting_notes",
-                "description": "Find meeting notes matching a query",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query for meeting notes"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "list_categories",
-                "description": "List all accessible categories",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        ]
-        
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {"tools": tools}
-        }
-    
-    async def _handle_tool_call(self, params: Dict[str, Any], request_id: Any) -> Dict[str, Any]:
-        """Handle tools/call request."""
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
-        
-        logger.info(f"Tool call: {tool_name} with args: {arguments}")
-        
-        # Get current role from arguments or use default
-        role_str = arguments.pop("role", "guest")
-        role = self.permission_manager.role_from_string(role_str)
-        
-        # Call the appropriate tool
-        if tool_name == "list_policies":
-            result = self.tools.list_policies(role)
-        elif tool_name == "read_document":
-            result = self.tools.read_document(arguments.get("doc_id"), role)
-        elif tool_name == "search_documents":
-            result = self.tools.search_documents(
-                arguments.get("query"),
-                role,
-                arguments.get("category")
-            )
-        elif tool_name == "find_meeting_notes":
-            result = self.tools.find_meeting_notes(arguments.get("query"), role)
-        elif tool_name == "list_categories":
-            result = self.tools.list_categories(role)
-        else:
-            return self._error_response(request_id, -32601, f"Unknown tool: {tool_name}")
-        
-        if result.success:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(result.data, indent=2)
-                        }
-                    ],
-                    "citations": result.citations or []
-                }
-            }
-        else:
-            return self._error_response(request_id, -32602, result.error)
-    
-    async def _handle_set_role(self, params: Dict[str, Any], request_id: Any) -> Dict[str, Any]:
-        """Handle set_role request (custom extension)."""
-        role_str = params.get("role", "guest")
-        self.current_role = self.permission_manager.role_from_string(role_str)
-        
-        logger.info(f"Role set to: {self.current_role}")
-        
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "role": self.current_role.value,
-                "accessible_categories": list(self.permission_manager.get_accessible_categories(self.current_role))
-            }
-        }
-    
-    def _error_response(self, request_id: Any, code: int, message: str) -> Dict[str, Any]:
-        """Create an error response."""
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": code,
-                "message": message
-            }
-        }
-    
-    async def run(self):
-        """Run the MCP server (stdio transport)."""
-        logger.info("Starting MCP server...")
-        
-        while True:
-            try:
-                # Read line from stdin
-                line = await asyncio.get_event_loop().run_in_executor(
-                    None, input
-                )
-                
-                if not line.strip():
-                    continue
-                
-                request = json.loads(line)
-                response = await self.handle_request(request)
-                print(json.dumps(response))
-                print()  # MCP requires blank line after response
-                
-            except EOFError:
-                logger.info("Client disconnected")
-                break
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error: {e}")
-            except Exception as e:
-                logger.error(f"Server error: {e}")
+            logger.error(f"Failed to parse COMPANY_BRAIN_CONNECTORS: {e}")
+    return sync
 
 
-async def main():
-    """Main entry point."""
-    server = MCPServer()
-    await server.run()
+# Build the knowledge base ONCE, when the server process starts.
+permission_manager = PermissionManager()
+embedding_search = EmbeddingSearch()
+
+sync_manager = _create_sync_manager()
+logger.info("Syncing documents from configured connectors...")
+documents = sync_manager.sync()
+logger.info(f"Loaded {len(documents)} documents")
+
+loader = DocumentLoader()
+loader.documents = {doc.id: doc for doc in documents}
+
+logger.info("Indexing documents for semantic search...")
+embedding_search.index_documents(documents)
+
+tools = MCPTools(loader, permission_manager, embedding_search)
+
+mcp = MCPServer(MCP_SERVER_NAME, version=MCP_SERVER_VERSION)
+
+
+def _to_dict(result: ToolResult) -> Dict[str, Any]:
+    """Serialize a ToolResult for the wire."""
+    return {
+        "success": result.success,
+        "data": result.data,
+        "citations": result.citations or [],
+        "error": result.error,
+    }
+
+
+@mcp.tool()
+def list_policies() -> Dict[str, Any]:
+    """List all policy documents."""
+    logger.info("Tool call: list_policies")
+    return _to_dict(tools.list_policies())
+
+
+@mcp.tool()
+def read_document(doc_id: str) -> Dict[str, Any]:
+    """Read a specific document by ID (e.g. 'policies/security_policy')."""
+    logger.info(f"Tool call: read_document doc_id={doc_id}")
+    return _to_dict(tools.read_document(doc_id))
+
+
+@mcp.tool()
+def search_documents(query: str, category: Optional[str] = None) -> Dict[str, Any]:
+    """Search documents by query, optionally restricted to one category."""
+    logger.info(f"Tool call: search_documents query={query!r} category={category}")
+    return _to_dict(tools.search_documents(query, category))
+
+
+@mcp.tool()
+def find_meeting_notes(query: str) -> Dict[str, Any]:
+    """Find meeting notes matching a query."""
+    logger.info(f"Tool call: find_meeting_notes query={query!r}")
+    return _to_dict(tools.find_meeting_notes(query))
+
+
+@mcp.tool()
+def list_categories() -> Dict[str, Any]:
+    """List all categories accessible to the server role."""
+    logger.info("Tool call: list_categories")
+    return _to_dict(tools.list_categories())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    logger.info(f"Starting MCP server (stdio) with role={SERVER_ROLE}...")
+    mcp.run()

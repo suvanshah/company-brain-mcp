@@ -19,7 +19,7 @@ class ConversationTurn:
 class ConversationHistory:
     """Track conversation context."""
     
-    def __init__(self, max_turns: int = 10):
+    def __init__(self, max_turns: int = 5):
         self.turns: List[ConversationTurn] = []
         self.max_turns = max_turns
     

@@ -1,8 +1,21 @@
 # MCP Server dependencies
-mcp>=0.1.0
+mcp>=2.0.0
+anyio>=4.0.0
 
 # Ollama integration
 requests>=2.31.0
+
+# Web UI
+streamlit>=1.40.0
+
+# Hybrid keyword search
+rank-bm25>=0.2.0
+
+# Persistent vector store
+chromadb>=1.5.0
+
+# HTTP MCP server
+uvicorn>=0.20.0
 
 # Utilities
 python-dotenv>=1.0.0
