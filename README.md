@@ -51,6 +51,12 @@ cd company-brain-mcp
 pip install -r requirements.txt
 ```
 
+For development and tests, also install the dev requirements:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 Optional for neural reranking:
 
 ```bash
@@ -232,11 +238,14 @@ Add markdown, text, or JSON files to `knowledge/<category>/`. The server indexes
 ### Running Tests
 
 ```bash
-# Run evaluation
-COMPANY_BRAIN_ROLE=admin python -m evals.evaluator
+# Run the unit test suite
+python -m unittest discover -s tests -p "test_*.py"
 
-# Run unit tests (when added)
+# Or with pytest
 python -m pytest tests/
+
+# Run the end-to-end evaluation (requires Ollama)
+COMPANY_BRAIN_ROLE=admin python -m evals.evaluator
 ```
 
 ## License

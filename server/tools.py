@@ -120,7 +120,6 @@ class MCPTools:
                     "category": chunk.document.category,
                     "section": chunk.section,
                     "snippet": result.snippet,
-                    "content": chunk.content,
                     "score": result.score,
                     "updated_at": chunk.document.updated_at
                 })
@@ -137,7 +136,6 @@ class MCPTools:
                             "category": doc.category,
                             "section": None,
                             "snippet": doc.content[:200] + "..." if len(doc.content) > 200 else doc.content,
-                            "content": doc.content,
                             "score": 0.0,
                             "updated_at": doc.updated_at
                         })

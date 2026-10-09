@@ -5,6 +5,7 @@ The server uses a simple API-key scheme by default. In production, replace this
 with an OAuth2/JWT validator or a reverse proxy that terminates identity.
 """
 
+import hmac
 import logging
 from typing import Awaitable, Callable
 
@@ -21,7 +22,8 @@ def _get_api_key_from_request(request: Request) -> str:
     """Extract the API key from the Authorization header or X-API-Key header."""
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
-        return auth.split(None, 1)[1].strip()
+        parts = auth.split(None, 1)
+        return parts[1].strip() if len(parts) > 1 else ""
     return request.headers.get("x-api-key", "")
 
 
@@ -44,7 +46,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         provided = _get_api_key_from_request(request)
-        if provided != self.api_key:
+        if not hmac.compare_digest(provided, self.api_key):
             logger.warning(f"Rejected request from {request.client}: invalid API key")
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
