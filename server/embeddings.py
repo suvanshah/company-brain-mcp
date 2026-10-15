@@ -69,10 +69,13 @@ class EmbeddingSearch:
                 timeout=30
             )
             response.raise_for_status()
-            return np.array(response.json()["embedding"])
+            embedding = np.array(response.json()["embedding"])
+            if not np.any(embedding):
+                raise RuntimeError("Ollama returned a zero embedding")
+            return embedding
         except Exception as e:
             logger.error(f"Error getting embedding from Ollama: {e}")
-            return np.zeros(768)  # Fallback to zeros
+            raise RuntimeError(f"Failed to get embedding from Ollama: {e}") from e
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:

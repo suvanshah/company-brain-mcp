@@ -5,11 +5,15 @@ Implements search_documents(), read_document(), list_policies(), find_meeting_no
 
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
+import logging
 
 from config import SERVER_ROLE
 from document_loader import DocumentLoader
 from permissions import PermissionManager
 from embeddings import EmbeddingSearch
+from graph_store import GraphStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,10 +28,11 @@ class ToolResult:
 class MCPTools:
     """MCP tools for document access and search."""
     
-    def __init__(self, document_loader: DocumentLoader, permission_manager: PermissionManager, embedding_search: EmbeddingSearch = None):
+    def __init__(self, document_loader: DocumentLoader, permission_manager: PermissionManager, embedding_search: EmbeddingSearch = None, graph_store: GraphStore = None):
         self.loader = document_loader
         self.permissions = permission_manager
         self.embedding_search = embedding_search
+        self.graph_store = graph_store
         self.role = permission_manager.role_from_string(SERVER_ROLE)
     
     def list_policies(self) -> ToolResult:
@@ -90,14 +95,20 @@ class MCPTools:
     def search_documents(self, query: str, category: Optional[str] = None) -> ToolResult:
         """Search documents by query using semantic + keyword search over chunks."""
         accessible_categories = self.permissions.get_accessible_categories(self.role)
-        
+        valid_categories = set(self.loader.category_dirs.keys())
+
         if category:
-            if category not in accessible_categories:
+            if category not in valid_categories:
+                logger.warning(f"Unknown category {category!r}; searching all accessible categories instead")
+                category = None
+            elif category not in accessible_categories:
                 return ToolResult(
                     success=False,
                     data=None,
                     error=f"Permission denied: Cannot search {category}"
                 )
+
+        if category:
             categories_to_search = [category]
         else:
             categories_to_search = list(accessible_categories)
@@ -120,7 +131,6 @@ class MCPTools:
                     "category": chunk.document.category,
                     "section": chunk.section,
                     "snippet": result.snippet,
-                    "content": chunk.content,
                     "score": result.score,
                     "updated_at": chunk.document.updated_at
                 })
@@ -137,7 +147,6 @@ class MCPTools:
                             "category": doc.category,
                             "section": None,
                             "snippet": doc.content[:200] + "..." if len(doc.content) > 200 else doc.content,
-                            "content": doc.content,
                             "score": 0.0,
                             "updated_at": doc.updated_at
                         })
@@ -167,19 +176,32 @@ class MCPTools:
                 data=None,
                 error="Permission denied: Cannot search meeting notes"
             )
-        
-        meetings = self.loader.get_documents_by_category("meetings")
+
+        if not self.embedding_search:
+            # Fallback to simple text search over whole documents
+            meetings = self.loader.get_documents_by_category("meetings")
+            results = []
+            for doc in meetings:
+                if query.lower() in doc.title.lower() or query.lower() in doc.content.lower():
+                    results.append({
+                        "id": doc.id,
+                        "title": doc.title,
+                        "date": doc.metadata.get("date", "unknown"),
+                        "snippet": doc.content[:200] + "..." if len(doc.content) > 200 else doc.content
+                    })
+            return ToolResult(success=True, data=results, citations=[r["id"] for r in results])
+
+        search_results = self.embedding_search.search(query, top_k=5, category="meetings")
         results = []
-        
-        for doc in meetings:
-            if query.lower() in doc.title.lower() or query.lower() in doc.content.lower():
-                results.append({
-                    "id": doc.id,
-                    "title": doc.title,
-                    "date": doc.metadata.get("date", "unknown"),
-                    "snippet": doc.content[:200] + "..." if len(doc.content) > 200 else doc.content
-                })
-        
+        for r in search_results:
+            doc = r.chunk.document
+            results.append({
+                "id": doc.id,
+                "title": doc.title,
+                "date": doc.metadata.get("date", "unknown"),
+                "snippet": r.snippet,
+            })
+
         return ToolResult(
             success=True,
             data=results,
@@ -201,4 +223,49 @@ class MCPTools:
         return ToolResult(
             success=True,
             data=category_info
+        )
+
+    def why(self, entity: str) -> ToolResult:
+        """Explain the rationale, actors, and relationships around an entity or decision."""
+        if not self.graph_store:
+            return ToolResult(
+                success=False,
+                data=None,
+                error="Knowledge graph not available"
+            )
+
+        triples = self.graph_store.find_related(entity)
+        results = []
+        docs_by_id = {}
+
+        for t in triples:
+            doc = self.loader.get_document(t["doc_id"])
+            if not doc or not self.permissions.can_read_document(self.role, doc.category):
+                continue
+            results.append(t)
+            docs_by_id[t["doc_id"]] = doc
+
+        if not results:
+            return ToolResult(
+                success=True,
+                data=[],
+                citations=[],
+                error=f"No relevant context found for '{entity}'"
+            )
+
+        # Only expose the most relevant source documents to the agent and UI.
+        top_results = results[:5]
+        citations = []
+        seen_doc_ids = set()
+        for t in top_results:
+            doc = docs_by_id[t["doc_id"]]
+            if doc.id in seen_doc_ids:
+                continue
+            seen_doc_ids.add(doc.id)
+            citations.append({"id": doc.id, "title": doc.title, "category": doc.category})
+
+        return ToolResult(
+            success=True,
+            data=top_results,
+            citations=citations
         )

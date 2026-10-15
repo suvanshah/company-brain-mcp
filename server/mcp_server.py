@@ -23,12 +23,14 @@ from connectors import SyncManager, FilesystemConnector  # noqa: E402
 
 from config import (
     MCP_SERVER_NAME, MCP_SERVER_VERSION, SERVER_ROLE, LOG_LEVEL, LOG_FILE,
-    KNOWLEDGE_DIR, CONNECTORS_JSON
+    KNOWLEDGE_DIR, CONNECTORS_JSON, BASE_DIR
 )
 from document_loader import DocumentLoader
 from permissions import PermissionManager
 from tools import MCPTools, ToolResult
 from embeddings import EmbeddingSearch
+from graph_store import GraphStore
+from extractor import TripleExtractor
 
 
 # Setup logging (never to stdout -- that is the MCP wire)
@@ -87,7 +89,12 @@ loader.documents = {doc.id: doc for doc in documents}
 logger.info("Indexing documents for semantic search...")
 embedding_search.index_documents(documents)
 
-tools = MCPTools(loader, permission_manager, embedding_search)
+logger.info("Building knowledge graph from documents...")
+graph_store = GraphStore(BASE_DIR / "data" / "graph.db")
+extractor = TripleExtractor()
+graph_store.ingest_documents(documents, extractor)
+
+tools = MCPTools(loader, permission_manager, embedding_search, graph_store)
 
 mcp = MCPServer(MCP_SERVER_NAME, version=MCP_SERVER_VERSION)
 
@@ -135,6 +142,13 @@ def list_categories() -> Dict[str, Any]:
     """List all categories accessible to the server role."""
     logger.info("Tool call: list_categories")
     return _to_dict(tools.list_categories())
+
+
+@mcp.tool()
+def why(entity: str) -> Dict[str, Any]:
+    """Explain the rationale, actors, and relationships around an entity or decision (e.g. 'authentication decision' or 'Q4 2024')."""
+    logger.info(f"Tool call: why entity={entity!r}")
+    return _to_dict(tools.why(entity))
 
 
 if __name__ == "__main__":
