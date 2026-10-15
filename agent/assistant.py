@@ -3,12 +3,14 @@ Main assistant for Company Brain Agent.
 Queries the MCP server (stdio subprocess or HTTP service) and synthesizes answers with citations.
 """
 
+import ast
 import json
 import logging
 import os
 import re
 import sys
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -34,10 +36,114 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SERVER_SCRIPT = PROJECT_ROOT / "server" / "mcp_server.py"
 MAX_TOOL_ITERATIONS = 5
 
+# Tool definitions for Ollama native tool-calling.
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_documents",
+            "description": "Search the knowledge base for relevant document chunks. Good for general 'what', 'who', 'when', and 'where' questions. For 'why' or rationale questions, use the `why` tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query."
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["policies", "product", "engineering", "meetings", "internal"],
+                        "description": "Optional category to restrict the search. Omit if unsure."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_document",
+            "description": "Read the full content of a document by its ID (e.g. 'policies/ai_deployment_policy'). Use this when you already know the exact document ID and need complete details.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {
+                        "type": "string",
+                        "description": "Document ID, e.g. 'policies/ai_deployment_policy'."
+                    }
+                },
+                "required": ["doc_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_policies",
+            "description": "List all policy documents the current role can access.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_meeting_notes",
+            "description": "Search meeting notes by keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword or phrase to search for in meeting notes."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_categories",
+            "description": "List all categories accessible to the current role.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "why",
+            "description": "Explain the rationale, actors, and relationships around an entity or decision. REQUIRED when the user asks a 'why' question or asks for the reason behind a decision. Example entities: 'authentication decision', 'OAuth 2.0 implementation', 'Q4 2024'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "description": "The entity or decision to explain, e.g. 'authentication decision', 'Q4 2024', 'AI deployment policy'."
+                    }
+                },
+                "required": ["entity"]
+            }
+        }
+    }
+]
+
 # Transport configuration
 MCP_URL = os.getenv("COMPANY_BRAIN_MCP_URL")
 API_KEY = os.getenv("COMPANY_BRAIN_API_KEY")
 HTTP_TIMEOUT = 300.0
+
+
+@dataclass
+class AnswerResult:
+    """Result of answering a question, including the answer text and tool-calling trace."""
+    text: str
+    steps: List[Dict[str, Any]]
+    sources: List[Any]
+
+    def __str__(self) -> str:
+        return self.text
 
 
 class CompanyBrainAssistant:
@@ -125,11 +231,13 @@ class CompanyBrainAssistant:
             doc_dict[data["id"]] = data
 
         for citation in result.get("citations", []):
-            if citation not in citations:
-                if isinstance(citation, str):
-                    citations.append({"id": citation})
-                else:
-                    citations.append(citation)
+            cid = citation if isinstance(citation, str) else citation.get("id")
+            if cid is None or any(c.get("id") == cid for c in citations):
+                continue
+            if isinstance(citation, str):
+                citations.append({"id": citation})
+            else:
+                citations.append(citation)
 
     @staticmethod
     def _extract_final_answer(content: str) -> Optional[str]:
@@ -181,19 +289,25 @@ class CompanyBrainAssistant:
             re.IGNORECASE | re.DOTALL
         )
         input_str = input_match.group(1).strip() if input_match else "{}"
-        # Sometimes the model wraps arguments in backticks or extra text; try to find JSON.
-        json_match = re.search(r'\{.*?\}', input_str, re.DOTALL)
-        if json_match:
-            input_str = json_match.group(0)
-        try:
-            args = json.loads(input_str)
-        except json.JSONDecodeError:
+        # Sometimes the model wraps arguments in backticks or extra text; try to find the dict.
+        dict_match = re.search(r'\{.*?\}', input_str, re.DOTALL)
+        if dict_match:
+            input_str = dict_match.group(0)
+        # LLMs may use Python literals (None, True/False, single quotes) instead of strict JSON.
+        for parser in (ast.literal_eval, json.loads):
+            try:
+                args = parser(input_str)
+            except (ValueError, SyntaxError, json.JSONDecodeError):
+                continue
+            if isinstance(args, dict):
+                break
+        else:
             logger.warning(f"Could not parse Action Input for {tool_name}: {input_str!r}")
             args = {}
         return tool_name, args
 
-    async def answer_question(self, question: str) -> str:
-        """Answer a question using a ReAct-style agent loop."""
+    async def answer_question(self, question: str) -> AnswerResult:
+        """Answer a question using the LLM's native tool-calling capability."""
         logger.info(f"Answering question: {question}")
 
         if not self.mcp_client:
@@ -208,42 +322,73 @@ class CompanyBrainAssistant:
 
         doc_dict: Dict[str, Dict] = {}
         citations: List[Any] = []
+        steps: List[Dict[str, Any]] = []
         final_answer = ""
         tool_calls_made = 0
 
-        for i in range(MAX_TOOL_ITERATIONS):
-            response = self.llm_client.chat(messages)
-            content = response.content.strip() if response.content else ""
-            logger.debug(f"Agent response ({i}): {content[:500]}")
-
-            final = self._extract_final_answer(content)
-            if final and tool_calls_made > 0:
-                final_answer = final
-                break
-            elif final:
-                # Model tried to answer before using any tools; ignore and force a search.
-                logger.warning("Model gave Final Answer before using tools; forcing search")
-
-            action = self._parse_action(content)
-            if not action:
-                if tool_calls_made == 0:
-                    # Force an initial search so the model has facts to work with.
-                    logger.warning("Model did not use a tool; forcing search_documents")
-                    action = ("search_documents", {"query": question})
-                else:
-                    # No further action and no final answer: use the raw content as the answer.
-                    final_answer = content
-                    break
-
-            tool_name, arguments = action
-            logger.info(f"Tool call: {tool_name}({arguments})")
-            result = await self.call_mcp_tool(tool_name, arguments)
+        # Route "why" / rationale questions straight to the knowledge graph tool.
+        # This is more reliable for small models that otherwise default to search_documents.
+        if re.match(r"\s*why\b", question, re.IGNORECASE):
+            entity = re.sub(r"^\s*why\s+(?:did|was|is|are|do|does)\s+(?:we|you|they|it)\s*", "", question, flags=re.IGNORECASE).strip()
+            entity = re.sub(r"^(?:did|was|is|are|do|does)\s+", "", entity, flags=re.IGNORECASE).strip()
+            if not entity:
+                entity = question
+            result = await self.call_mcp_tool("why", {"entity": entity})
+            steps.append({"tool": "why", "arguments": {"entity": entity}, "result": result, "error": result.get("error")})
             self._collect_doc_info(result, doc_dict, citations)
             tool_calls_made += 1
+            messages.append({"role": "assistant", "content": f"I need to explain the rationale for '{entity}'."})
+            messages.append({"role": "user", "content": f"Observation: {self._format_observation(result)}"})
 
-            # Append the assistant's reasoning and a clean observation to continue the loop.
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": self._format_observation(result)})
+        for i in range(MAX_TOOL_ITERATIONS):
+            response = self.llm_client.chat(messages, tools=TOOLS)
+            content = response.content.strip() if response.content else ""
+            logger.debug(f"Agent response ({i}): content={content!r} tool_calls={len(response.tool_calls)}")
+
+            if not response.tool_calls:
+                if tool_calls_made > 0:
+                    # The model is ready to answer.
+                    final_answer = content
+                    break
+                # Force an initial search so the model has facts to work with.
+                logger.warning("Model did not call a tool; forcing search_documents")
+                result = await self.call_mcp_tool("search_documents", {"query": question})
+                steps.append({"tool": "search_documents", "arguments": {"query": question}, "result": result, "error": result.get("error")})
+                self._collect_doc_info(result, doc_dict, citations)
+                tool_calls_made += 1
+                messages.append({"role": "assistant", "content": "I need to search the knowledge base."})
+                messages.append({"role": "user", "content": f"Observation: {self._format_observation(result)}"})
+                continue
+
+            # The model wants to call one or more tools.
+            assistant_message: Dict[str, Any] = {"role": "assistant", "content": content, "tool_calls": []}
+            tool_messages: List[Dict[str, Any]] = []
+            for idx, tc in enumerate(response.tool_calls):
+                tool_name = tc.name
+                arguments = tc.arguments
+                logger.info(f"Tool call: {tool_name}({arguments})")
+                result = await self.call_mcp_tool(tool_name, arguments)
+                steps.append({"tool": tool_name, "arguments": arguments, "result": result, "error": result.get("error")})
+                self._collect_doc_info(result, doc_dict, citations)
+                tool_calls_made += 1
+
+                tool_call_id = tc.raw.get("id") or f"call_{i}_{idx}"
+                assistant_message["tool_calls"].append({
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": arguments,
+                    },
+                })
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(result),
+                })
+
+            messages.append(assistant_message)
+            messages.extend(tool_messages)
 
         if not final_answer:
             final_answer = "I couldn't find a clear answer in the company documents."
@@ -257,7 +402,7 @@ class CompanyBrainAssistant:
         body = final_answer.split("\n\n**Sources:**\n")[0].strip()
         self.conversation_history.add_assistant_message(body, citations)
 
-        return final_answer
+        return AnswerResult(text=final_answer, steps=steps, sources=citations)
     
     def get_last_citations(self) -> List[Any]:
         """Return the citations from the most recent assistant turn."""
@@ -295,7 +440,7 @@ async def main():
                     continue
                 
                 answer = await assistant.answer_question(question)
-                print(f"\nAnswer: {answer}")
+                print(f"\nAnswer: {answer.text}")
         
         except EOFError:
             pass
