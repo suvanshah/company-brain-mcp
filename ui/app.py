@@ -12,8 +12,10 @@ Run from the project root:  streamlit run ui/app.py
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
+import zipfile
 from pathlib import Path
 
 import streamlit as st
@@ -21,6 +23,8 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.assistant import AnswerResult, CompanyBrainAssistant  # noqa: E402
+from components.logo_uploader import logo_uploader  # noqa: E402
+from connectors.slack import SlackExportConnector  # noqa: E402
 from server.config import OLLAMA_EMBEDDING_MODEL, OLLAMA_LLM_MODEL  # noqa: E402
 
 
@@ -107,6 +111,104 @@ with st.sidebar:
         st.session_state.messages = []
         worker.clear()
         st.rerun()
+
+    st.divider()
+    st.subheader("Ingest documents")
+
+    source = st.radio(
+        "Source",
+        ["Local", "Slack", "GitHub"],
+        horizontal=True,
+        help="Choose the document source.",
+    )
+
+    knowledge_root = Path(__file__).resolve().parent.parent / "knowledge"
+    categories = ["policies", "product", "engineering", "meetings", "internal"]
+
+    if source == "Local":
+        st.caption("Markdown, text, or JSON files to store under knowledge/<category>/")
+        uploaded = logo_uploader(
+            service="file",
+            accept=".md,.txt,.json",
+            label="Upload files",
+            multiple=True,
+            key="local_files",
+        )
+        cat = st.selectbox("Save to category", categories, key="local_cat")
+        if st.button("Save", key="local_save") and uploaded:
+            for f in uploaded:
+                target = knowledge_root / cat / f["name"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(bytes(f["bytes"]))
+            st.success(f"Saved {len(uploaded)} file(s) to knowledge/{cat}. Restart to index them.")
+
+    elif source == "Slack":
+        st.caption("Official Slack export .zip with channel/YYYY-MM-DD.json files")
+        slack_zip = logo_uploader(
+            service="slack",
+            accept=".zip",
+            label="Upload Slack export",
+            key="slack_zip",
+        )
+        cat = st.selectbox("Save to category", categories, index=3, key="slack_cat")
+        if st.button("Import", key="slack_import") and slack_zip:
+            uploads = knowledge_root.parent / "uploads"
+            uploads.mkdir(parents=True, exist_ok=True)
+            zip_path = uploads / slack_zip[0]["name"]
+            zip_path.write_bytes(bytes(slack_zip[0]["bytes"]))
+            try:
+                connector = SlackExportConnector(
+                    "ui_slack",
+                    {"export_path": str(zip_path), "category": cat},
+                )
+                docs = connector.fetch()
+                count = 0
+                for doc in docs:
+                    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", doc.source_id)
+                    target = knowledge_root / cat / f"{safe}.md"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(doc.content, encoding="utf-8")
+                    count += 1
+                st.success(f"Converted {count} channel/day file(s) to knowledge/{cat}. Restart to index.")
+            except Exception as e:
+                st.error(f"Slack import failed: {e}")
+
+    elif source == "GitHub":
+        st.caption("Upload a GitHub repository .zip (Code → Download ZIP)")
+        github_zip = logo_uploader(
+            service="github",
+            accept=".zip",
+            label="Upload GitHub repo",
+            key="github_zip",
+        )
+        cat = st.selectbox("Save to category", categories, key="gh_cat")
+        if st.button("Import", key="gh_import") and github_zip:
+            uploads = knowledge_root.parent / "uploads"
+            uploads.mkdir(parents=True, exist_ok=True)
+            zip_path = uploads / github_zip[0]["name"]
+            zip_path.write_bytes(bytes(github_zip[0]["bytes"]))
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    all_names = [n for n in zf.namelist() if not n.endswith("/")]
+                    top_dirs = {n.split("/")[0] for n in all_names if "/" in n}
+                    prefix = f"{list(top_dirs)[0]}/" if len(top_dirs) == 1 else ""
+                    count = 0
+                    for name in all_names:
+                        if not name.lower().endswith((".md", ".txt")):
+                            continue
+                        rel = name[len(prefix):] if name.startswith(prefix) else name
+                        if not rel:
+                            continue
+                        safe = re.sub(r"[^a-zA-Z0-9._/-]", "_", rel).replace("..", "_")
+                        target = (knowledge_root / cat / safe).resolve()
+                        if not target.is_relative_to(knowledge_root / cat):
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(zf.read(name).decode("utf-8"), encoding="utf-8")
+                        count += 1
+                st.success(f"Extracted {count} file(s) to knowledge/{cat}. Restart to index.")
+            except Exception as e:
+                st.error(f"GitHub import failed: {e}")
 
 def _step_query(tool: str, args: dict) -> str:
     """Convert tool arguments into a short, human-readable query string."""

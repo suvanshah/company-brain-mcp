@@ -4,7 +4,11 @@ Connectors for syncing company documents into Company Brain.
 
 from .base import BaseConnector, ConnectorDocument
 from .filesystem import FilesystemConnector
-from .sync_manager import SyncManager
+
+try:
+    from .sync_manager import SyncManager
+except ImportError:
+    SyncManager = None  # type: ignore
 
 try:
     from .github import GitHubConnector
